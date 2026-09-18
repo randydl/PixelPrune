@@ -64,22 +64,14 @@ except ImportError:
 
 
 def apply_patches() -> None:
-    """对 vLLM Qwen3.5 应用 PixelPrune monkey-patch。
-
-    1. 先 apply qwen3_vl 的 patch（patch 父类 + Processor + VisionTransformer）
-    2. 再显式 patch Qwen3.5 自身的类（确保不依赖 Python MRO 隐式继承）
-    """
+    """对 vLLM Qwen3.5 应用 PixelPrune monkey-patch：先 patch 父类，再显式 patch Qwen3.5 自身。"""
     if getattr(qwen3_5.Qwen3_5ForConditionalGeneration, "__pixelprune_patched__", False):
         return
 
-    # Step 1: Patch 父类（Qwen3VLForConditionalGeneration、Qwen3VLMultiModalProcessor、
-    #          Qwen3_VisionTransformer）—— 这些是共享的基础组件
+    # Step 1: patch 父类共享组件（Qwen3VLForConditionalGeneration / Processor / VisionTransformer）
     _apply_qwen3vl_patches()
 
-    # Step 2: 显式 patch Qwen3_5ForConditionalGeneration 上的方法。
-    # 虽然通过 MRO 这些方法已经指向了 patched 版本，但显式 patch 确保：
-    # (a) 即使 Qwen3.5 未来覆盖这些方法，patch 仍然生效
-    # (b) 代码意图清晰，不依赖隐式继承
+    # Step 2: 显式 patch Qwen3_5 自身方法，不依赖 MRO 隐式继承，意图清晰且抗未来覆盖。
     _patch(qwen3_5.Qwen3_5ForConditionalGeneration,
            "_parse_and_validate_image_input", _parse_image_input)
     _patch(qwen3_5.Qwen3_5ForConditionalGeneration,

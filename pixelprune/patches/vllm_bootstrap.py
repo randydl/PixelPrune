@@ -8,12 +8,7 @@ def _enabled() -> bool:
 
 
 def _strict() -> bool:
-    """补丁失败时是否直接报错终止进程。
-
-    默认 True。静默降级会让服务正常启动并返回**未剪枝**的结果，而使用者无从察觉——
-    在评估场景下这会产出被误标为 PixelPrune 的 baseline 数值，因此默认必须响亮失败。
-    仅在明确知晓后果时才用 PIXELPRUNE_STRICT=false 换取"带病运行"。
-    """
+    """补丁失败时是否直接报错终止（默认 True，避免静默返回未剪枝结果）。"""
     return os.environ.get("PIXELPRUNE_STRICT", "true").lower() not in ("false", "0", "no")
 
 
@@ -27,10 +22,7 @@ def _warn(msg: str) -> None:
 
 
 def maybe_apply_patches() -> None:
-    """vLLM 调用的入口函数。未启用时立即返回，启用时才懒加载真正的 patch。
-
-    启用状态下若补丁失败，默认抛错（见 _strict），避免"以为开了剪枝、其实没开"。
-    """
+    """vLLM 调用的入口函数：未启用时立即返回，启用时懒加载 patch；失败默认报错。"""
     if not _enabled():
         return
 
