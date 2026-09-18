@@ -1,8 +1,21 @@
 """
-vLLM Qwen3-VL monkey-patch：使用 PixelPrune 选择器计算 keep_indices，支持多种方法。
+vLLM Qwen3-VL monkey-patch (vLLM >= 0.29): 使用 PixelPrune 选择器计算
+keep_indices，在 ViT 输入层裁剪 patch，并同步修正 mrope 位置与占位符数量。
 
-环境变量：PIXELPRUNE_ENABLED, PIXELPRUNE_METHOD, PIXELPRUNE_METRIC, PIXELPRUNE_THRESHOLD, PIXELPRUNE_VERBOSE
-在创建 vLLM LLM 前调用 apply_patches()。
+适配 vLLM 0.29 的主要变化：
+- ``Qwen3_VisionTransformer.forward`` 改为接收 ``encoder_metadata`` 字典
+  （由 ``prepare_encoder_metadata`` 计算），不再内联计算 cu_seqlens 等。
+- ``Qwen3VLMultiModalProcessor._call_hf_processor`` 被替换为
+  ``_apply_hf_processor_main(self, mm_items, hf_processor_mm_kwargs)``，
+  返回 BatchFeature。
+- ``get_mrope_input_positions`` 委托给静态方法 ``_get_mrope_input_positions``，
+  mm_features 为 ``MultiModalFeatureSpec`` 列表，``.data`` 为
+  ``MultiModalKwargsItem``。
+- 默认 ``cudagraph_mm_encoder=False``；为安全起见，启用 PixelPrune 时强制
+  关闭 encoder CUDA graph（输出 token 数随 keep_indices 变化，无法固定 shape）。
+
+环境变量：PIXELPRUNE_ENABLED, PIXELPRUNE_METHOD, PIXELPRUNE_METRIC,
+PIXELPRUNE_THRESHOLD, PIXELPRUNE_VERBOSE。在创建 vLLM LLM 前调用 apply_patches()。
 """
 
 from __future__ import annotations
@@ -36,7 +49,7 @@ from vllm.multimodal.inputs import MultiModalFieldConfig
 from vllm.multimodal.processing import PromptReplacement, PromptUpdate
 
 try:
-    from transformers import BatchFeature
+    from transformers.feature_extraction_utils import BatchFeature
 except Exception:
     BatchFeature = None
 
@@ -61,6 +74,9 @@ def normalize_pixel_values_for_selector(pixel_values: torch.Tensor) -> torch.Ten
 
 
 def _unwrap_data(x: Any) -> Any:
+    """从 MultiModalFieldElem / 包装对象中取出原始张量。"""
+    if x is None:
+        return None
     return getattr(x, "data", x)
 
 
@@ -71,7 +87,7 @@ def _unwrap_data(x: Any) -> Any:
 
 def _select_packed_by_indices(
     tensor: torch.Tensor,
-    grid_thw: torch.Tensor | list,
+    grid_thw: Any,
     keep_indices: List[torch.Tensor],
 ) -> torch.Tensor:
     """从 packed tensor 中按每张图的 keep_indices 选择 token。"""
@@ -94,12 +110,16 @@ def _vt_forward(
     self: Any,
     x: torch.Tensor,
     grid_thw: Any,
+    *,
     keep_indices: List[torch.Tensor] | None = None,
+    encoder_metadata: Mapping[str, Any] | None = None,
 ) -> torch.Tensor:
-    """Patched VisionTransformer.forward: 支持 keep_indices 在 ViT 输入层裁剪 patch。
+    """Patched Qwen3_VisionTransformer.forward (vLLM 0.29)：
 
-    - 使用 MMEncoderAttention 计算 sequence_lengths / max_seqlen / cu_seqlens
-    - block.forward 传 sequence_lengths 参数
+    - 复用 ``prepare_encoder_metadata`` 计算全量 pos_embed / rotary / cu_seqlens。
+    - 若提供 keep_indices，则在 patch_embed 之后按 patch 级索引裁剪
+      hidden_states / pos_embeds / rotary，并基于裁剪后的长度重算
+      cu_seqlens / sequence_lengths / max_seqlen。
     """
     from vllm.model_executor.layers.attention.mm_encoder_attention import (
         MMEncoderAttention,
@@ -107,51 +127,62 @@ def _vt_forward(
 
     if isinstance(grid_thw, list):
         grid_thw_list = grid_thw
-        grid_thw_np = np.array(grid_thw, dtype=np.int32)
     else:
         grid_thw_list = grid_thw.tolist()
-        grid_thw_np = grid_thw.numpy() if hasattr(grid_thw, "numpy") else np.array(grid_thw.cpu())
 
     hidden_states = x.to(device=self.device, dtype=self.dtype, non_blocking=True)
     hidden_states = self.patch_embed(hidden_states)
-    pos_embeds = self.fast_pos_embed_interpolate(grid_thw_list)
-    rotary_pos_emb_cos, rotary_pos_emb_sin = self.rot_pos_emb(grid_thw_list)
+
+    if encoder_metadata is None:
+        encoder_metadata = self.prepare_encoder_metadata(grid_thw_list)
+
+    pos_embeds = encoder_metadata["pos_embeds"]
+    rotary_pos_emb_cos = encoder_metadata["rotary_pos_emb_cos"]
+    rotary_pos_emb_sin = encoder_metadata["rotary_pos_emb_sin"]
 
     has_prune = keep_indices is not None
 
     if has_prune:
-        # Select patches according to keep_indices
-        hidden_states = _select_packed_by_indices(hidden_states, grid_thw_list, keep_indices)
-        pos_embeds_sel = _select_packed_by_indices(pos_embeds, grid_thw_list, keep_indices)
-        rotary_pos_emb_cos = _select_packed_by_indices(rotary_pos_emb_cos, grid_thw_list, keep_indices)
-        rotary_pos_emb_sin = _select_packed_by_indices(rotary_pos_emb_sin, grid_thw_list, keep_indices)
-        hidden_states = hidden_states + pos_embeds_sel
+        # PixelPrune: 按每张图的 patch 级 keep_indices 裁剪 ViT 输入。
+        hidden_states = _select_packed_by_indices(
+            hidden_states, grid_thw_list, keep_indices
+        )
+        pos_embeds = _select_packed_by_indices(
+            pos_embeds, grid_thw_list, keep_indices
+        )
+        rotary_pos_emb_cos = _select_packed_by_indices(
+            rotary_pos_emb_cos, grid_thw_list, keep_indices
+        )
+        rotary_pos_emb_sin = _select_packed_by_indices(
+            rotary_pos_emb_sin, grid_thw_list, keep_indices
+        )
 
-        lens = [len(idx) for idx in keep_indices]
+        # 基于裁剪后的每图 patch 数重算 attention 元数据。
+        lens = [int(len(idx)) for idx in keep_indices]
         cu_seqlens = np.array([0] + list(np.cumsum(lens)), dtype=np.int32)
+        sequence_lengths = MMEncoderAttention.maybe_compute_seq_lens(
+            self.attn_backend, cu_seqlens, self.device
+        )
+        max_seqlen = torch.tensor(
+            MMEncoderAttention.compute_max_seqlen(self.attn_backend, cu_seqlens),
+            dtype=torch.int32,
+        )
+        cu_seqlens = MMEncoderAttention.maybe_recompute_cu_seqlens(
+            self.attn_backend,
+            cu_seqlens,
+            self.hidden_size,
+            self.tp_size,
+            self.device,
+            fp8_padded_hidden_size=getattr(self, "fp8_padded_hidden_size", None),
+        )
     else:
-        hidden_states = hidden_states + pos_embeds
-        cu_seqlens = np.repeat(
-            grid_thw_np[:, 1] * grid_thw_np[:, 2], grid_thw_np[:, 0]
-        ).cumsum(axis=0, dtype=np.int32)
-        cu_seqlens = np.concatenate([np.zeros(1, dtype=np.int32), cu_seqlens])
+        cu_seqlens = encoder_metadata["cu_seqlens"]
+        sequence_lengths = encoder_metadata.get("sequence_lengths")
+        max_seqlen = encoder_metadata["max_seqlen"]
 
-    sequence_lengths = MMEncoderAttention.maybe_compute_seq_lens(
-        self.attn_backend, cu_seqlens, self.device
-    )
-    max_seqlen = torch.tensor(
-        MMEncoderAttention.compute_max_seqlen(self.attn_backend, cu_seqlens),
-        dtype=torch.int32,
-    )
-    cu_seqlens = MMEncoderAttention.maybe_recompute_cu_seqlens(
-        self.attn_backend,
-        cu_seqlens,
-        self.hidden_size,
-        self.tp_size,
-        self.device,
-    )
-
+    hidden_states = hidden_states + pos_embeds
     hidden_states = hidden_states.unsqueeze(1)
+
     deepstack_feature_lists = []
     for layer_num, blk in enumerate(self.blocks):
         hidden_states = blk(
@@ -164,8 +195,11 @@ def _vt_forward(
         )
         if layer_num in self.deepstack_visual_indexes:
             deepstack_merger_idx = self.deepstack_visual_indexes.index(layer_num)
-            deepstack_feature = self.deepstack_merger_list[deepstack_merger_idx](hidden_states)
+            deepstack_feature = self.deepstack_merger_list[deepstack_merger_idx](
+                hidden_states
+            )
             deepstack_feature_lists.append(deepstack_feature)
+
     hidden_states = self.merger(hidden_states)
     output = torch.cat([hidden_states] + deepstack_feature_lists, dim=1)
     return output
@@ -218,7 +252,9 @@ def _process_image_input(self: Any, image_input: Any) -> tuple:
                 "PixelPrune (keep_indices) 不支持 data parallel 模式"
             )
         if self.use_data_parallel:
-            from vllm.model_executor.models.vision import run_dp_sharded_mrope_vision_model
+            from vllm.model_executor.models.vision import (
+                run_dp_sharded_mrope_vision_model,
+            )
             return run_dp_sharded_mrope_vision_model(
                 self.visual, pixel_values, grid_thw.tolist(), rope_type="rope_3d"
             )
@@ -242,8 +278,10 @@ def _get_mrope_input_positions(
 ) -> tuple:
     """Patched get_mrope_input_positions: 支持 keep_indices 修正空间位置。
 
-    - 使用 _iter_mm_grid_hw 静态方法 (4 参数, 返回 4 元组)
-    - 当有 keep_indices 时，用实际空间坐标替代默认的 grid_indices
+    vLLM 0.29 中 ``_iter_mm_grid_hw`` 对 image 仍返回全量
+    ``actual_num_tokens = llm_grid_h * llm_grid_w``，但 PixelPrune 的占位符
+    只有 ``num_kept`` 个 token，因此必须用 keep_indices 重算空间坐标并按
+    裁剪后的数量推进 ``st``。
     """
     spatial_merge_size = self.config.vision_config.spatial_merge_size
     merge_length = spatial_merge_size * spatial_merge_size
@@ -254,7 +292,6 @@ def _get_mrope_input_positions(
     )
     mm_feature_map = {f.mm_position.offset: f for f in image_features}
 
-    # Delegate to original static method for iteration
     llm_pos_ids_list = []
     st = 0
     for (
@@ -275,43 +312,48 @@ def _get_mrope_input_positions(
             continue
 
         text_len = offset - st
-        st_idx = int(llm_pos_ids_list[-1].max() + 1) if llm_pos_ids_list else 0
+        st_idx = (
+            int(llm_pos_ids_list[-1].max() + 1) if llm_pos_ids_list else 0
+        )
 
         # Text positions
         if text_len > 0:
-            text_positions = np.broadcast_to(np.arange(text_len), (3, text_len)) + st_idx
+            text_positions = np.broadcast_to(
+                np.arange(text_len), (3, text_len)
+            ) + st_idx
             llm_pos_ids_list.append(text_positions)
             st_idx += text_len
 
         # Check if this is an image with keep_indices
         mm_feature = mm_feature_map.get(offset)
         if mm_feature is not None:
-            ki_data = _unwrap_data(mm_feature.data.get("keep_indices"))
+            ki_data = _unwrap_data(
+                mm_feature.data.get("keep_indices") if mm_feature.data else None
+            )
             if ki_data is not None:
                 # PixelPrune: use keep_indices to compute correct spatial positions
-                keep_indices_tensor = ki_data
-                if isinstance(keep_indices_tensor, torch.Tensor):
-                    keep_indices_np = keep_indices_tensor.cpu().numpy()
+                if isinstance(ki_data, torch.Tensor):
+                    keep_indices_np = ki_data.cpu().numpy()
                 else:
-                    keep_indices_np = np.array(keep_indices_tensor)
+                    keep_indices_np = np.asarray(ki_data)
 
-                # Convert patch-level keep_indices to merged-level token indices
-                # keep_indices are patch-level (block_size consecutive per merged token)
+                # keep_indices 是 patch 级；每个 merged token 对应
+                # merge_length 个连续 patch，取每块第 0 个 patch // merge_length
+                # 得到 merged 级索引。
                 merged_indices = keep_indices_np[::merge_length] // merge_length
                 num_kept_tokens = len(merged_indices)
                 llm_w = llm_grid_w
 
-                # Recover spatial (t, h, w) coordinates from merged indices
+                # 从 merged 索引恢复 (t, h, w) 空间坐标
                 token_t = merged_indices // (llm_grid_h * llm_w)
                 token_hw = merged_indices % (llm_grid_h * llm_w)
                 token_h = token_hw // llm_w
                 token_w = token_hw % llm_w
 
-                frame_positions = np.stack([
-                    token_t + st_idx,
-                    token_h + st_idx,
-                    token_w + st_idx,
-                ], axis=0)
+                frame_positions = np.stack(
+                    [token_t + st_idx, token_h + st_idx, token_w + st_idx],
+                    axis=0,
+                )
                 llm_pos_ids_list.append(frame_positions)
                 st = offset + num_kept_tokens
                 continue
@@ -338,7 +380,9 @@ def _get_mrope_input_positions(
 
     # Trailing text
     if st < len(input_tokens):
-        st_idx = int(llm_pos_ids_list[-1].max() + 1) if llm_pos_ids_list else 0
+        st_idx = (
+            int(llm_pos_ids_list[-1].max() + 1) if llm_pos_ids_list else 0
+        )
         text_len = len(input_tokens) - st
         llm_pos_ids_list.append(
             np.broadcast_to(np.arange(text_len), (3, text_len)) + st_idx
@@ -354,6 +398,20 @@ def _get_mrope_input_positions(
     return torch.from_numpy(llm_positions), mrope_position_delta
 
 
+def _get_encoder_cudagraph_config(self: Any) -> Any:
+    """Patched get_encoder_cudagraph_config: 启用 PixelPrune 时禁用 encoder
+    CUDA graph（输出 token 数随 keep_indices 变化，无法匹配固定 budget）。"""
+    cfg = _orig(
+        qwen3_vl.Qwen3VLForConditionalGeneration, "get_encoder_cudagraph_config"
+    )(self)
+    if os.environ.get("PIXELPRUNE_ENABLED", "").lower() in ("1", "true", "yes"):
+        try:
+            cfg.modalities = []
+        except Exception:
+            pass
+    return cfg
+
+
 # ======================= Patched Processor =======================
 
 
@@ -365,16 +423,14 @@ def _mmp_init(self: Any, *args: Any, **kwargs: Any) -> None:
     )
 
 
-def _mmp_call_hf(
+def _mmp_apply_hf_processor_main(
     self: Any,
-    prompt: str,
-    mm_data: Mapping[str, object],
-    mm_kwargs: Mapping[str, object],
-    tok_kwargs: Mapping[str, object],
+    mm_items: Any,
+    hf_processor_mm_kwargs: Mapping[str, object],
 ) -> Any:
-    """Patched _call_hf_processor: 计算 keep_indices 并注入到输出。"""
-    out = _orig(qwen3_vl.Qwen3VLMultiModalProcessor, "_call_hf_processor")(
-        self, prompt, mm_data, mm_kwargs, tok_kwargs
+    """Patched _apply_hf_processor_main: 计算 keep_indices 并注入到输出。"""
+    out = _orig(qwen3_vl.Qwen3VLMultiModalProcessor, "_apply_hf_processor_main")(
+        self, mm_items, hf_processor_mm_kwargs
     )
     if self._pixelprune_enabled:
         pixel_values = out.get("pixel_values")
@@ -453,15 +509,15 @@ def _verbose_log(
 
 
 def _mmp_fields(
-    self: Any, hf_inputs: Any, hf_mm_kwargs: Mapping[str, object]
+    self: Any, hf_inputs: Any, hf_processor_mm_kwargs: Mapping[str, object]
 ) -> Mapping[str, Any]:
     """Patched _get_mm_fields_config: 注册 keep_indices 字段。"""
     cfg = _orig(qwen3_vl.Qwen3VLMultiModalProcessor, "_get_mm_fields_config")(
-        self, hf_inputs, hf_mm_kwargs
+        self, hf_inputs, hf_processor_mm_kwargs
     )
     cfg = dict(cfg)
     if "keep_indices" in hf_inputs:
-        cfg["keep_indices"] = MultiModalFieldConfig.batched("image")
+        cfg["keep_indices"] = MultiModalFieldConfig.batched("image", keep_on_cpu=True)
     return cfg
 
 
@@ -496,7 +552,8 @@ def _mmp_prompt_updates(
     for u in ups:
         if u.modality == "image":
             new_ups.append(PromptReplacement(
-                modality="image", target=u.target, replacement=get_image_replacement_prune
+                modality="image", target=u.target,
+                replacement=get_image_replacement_prune,
             ))
         else:
             new_ups.append(u)
@@ -523,12 +580,19 @@ def _patch(cls: type, name: str, fn: Any) -> None:
 
 _PATCHES = [
     (qwen3_vl.Qwen3VLMultiModalProcessor, "__init__", _mmp_init),
-    (qwen3_vl.Qwen3VLMultiModalProcessor, "_call_hf_processor", _mmp_call_hf),
+    (qwen3_vl.Qwen3VLMultiModalProcessor, "_apply_hf_processor_main",
+     _mmp_apply_hf_processor_main),
     (qwen3_vl.Qwen3VLMultiModalProcessor, "_get_mm_fields_config", _mmp_fields),
-    (qwen3_vl.Qwen3VLMultiModalProcessor, "_get_prompt_updates", _mmp_prompt_updates),
-    (qwen3_vl.Qwen3VLForConditionalGeneration, "_parse_and_validate_image_input", _parse_image_input),
-    (qwen3_vl.Qwen3VLForConditionalGeneration, "_process_image_input", _process_image_input),
-    (qwen3_vl.Qwen3VLForConditionalGeneration, "get_mrope_input_positions", _get_mrope_input_positions),
+    (qwen3_vl.Qwen3VLMultiModalProcessor, "_get_prompt_updates",
+     _mmp_prompt_updates),
+    (qwen3_vl.Qwen3VLForConditionalGeneration,
+     "_parse_and_validate_image_input", _parse_image_input),
+    (qwen3_vl.Qwen3VLForConditionalGeneration, "_process_image_input",
+     _process_image_input),
+    (qwen3_vl.Qwen3VLForConditionalGeneration, "get_mrope_input_positions",
+     _get_mrope_input_positions),
+    (qwen3_vl.Qwen3VLForConditionalGeneration, "get_encoder_cudagraph_config",
+     _get_encoder_cudagraph_config),
     (qwen3_vl.Qwen3_VisionTransformer, "forward", _vt_forward),
 ]
 

@@ -20,7 +20,7 @@ git clone https://github.com/OPPO-Mente-Lab/PixelPrune.git
 cd PixelPrune
 pip install -e .
 ```
-Tested with `transformers==4.57.6` and `vllm==0.18.0`. Qwen3.5 + HuggingFace requires `transformers>=5.2.0`.
+Tested with `transformers==4.57.6` and `vllm==0.29.0`. Qwen3.5 + HuggingFace requires `transformers>=5.2.0`. The vLLM integration requires `vllm>=0.29.0` (the processor / vision-encoder APIs changed significantly in 0.29, so the patches target the new API and no longer support older versions).
 
 ## Quick Start
 
