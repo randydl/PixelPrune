@@ -10,9 +10,12 @@ prompt = "What is the title of this document? Reply in one short sentence."
 with open(image_path, "rb") as f:
     image_url = f"data:image/jpeg;base64,{base64.b64encode(f.read()).decode()}"
 
-client = OpenAI()
+client = OpenAI(
+    base_url="http://localhost:18000/v1",
+    api_key="EMPTY",
+)
 resp = client.chat.completions.create(
-    model="Qwen3.5-0.8B",
+    model="Qwen3.8-27B-FP8",
     messages=[{
         "role": "user",
         "content": [
