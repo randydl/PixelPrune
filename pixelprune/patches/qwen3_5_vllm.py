@@ -45,7 +45,7 @@ except Exception:
 from .qwen3_vl_vllm import (
     apply_patches as _apply_qwen3vl_patches,
     _mmp_init,
-    _mmp_call_hf,
+    _mmp_apply_hf,
     _mmp_fields,
     _mmp_prompt_updates,
     _parse_image_input,

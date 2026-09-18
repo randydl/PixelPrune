@@ -1,0 +1,32 @@
+# PixelPrune for vLLM —— 派生镜像（固化部署）
+#
+# 构建：
+#   docker build -f docker/Dockerfile.vllm -t pixelprune-vllm:0.29.0 .
+#
+# 运行（启用剪枝）：
+#   docker run --gpus all --ipc=host -p 18000:8000 \
+#     -v /mnt/models:/models \
+#     -e PIXELPRUNE_ENABLED=true \
+#     pixelprune-vllm:0.29.0 \
+#     /models/Qwen/Qwen3.5-2B --served-model-name Qwen3.5-2B ...
+#
+# 不设置 PIXELPRUNE_ENABLED 时行为与官方镜像完全一致（插件立即返回）。
+#
+# 为什么需要派生镜像而不是挂载仓库：PixelPrune 通过 setup.py 声明的
+# `vllm.general_plugins` entry point 自动加载，而 entry point 由**已安装发行版**
+# 的元数据提供 —— 仅设置 PYTHONPATH 不会让 vLLM 发现插件。
+# 若需要改代码即时生效的开发流程，改用 scripts/vllm_entrypoint.sh。
+
+ARG VLLM_IMAGE=vllm/vllm-openai:v0.29.0-cu129
+FROM ${VLLM_IMAGE}
+
+# 只复制打包所需内容，避免把 .git / assets / 评估产物带进镜像
+COPY setup.py /opt/pixelprune/setup.py
+COPY pixelprune /opt/pixelprune/pixelprune
+
+# --no-deps：pixelprune 仅依赖 numpy，vLLM 镜像中已具备
+RUN pip install /opt/pixelprune --no-deps -q \
+    && python3 -c "import pixelprune; print('pixelprune', pixelprune.__version__)"
+
+# 默认关闭，显式设为 false 以便 `docker inspect` 时可见
+ENV PIXELPRUNE_ENABLED=false
